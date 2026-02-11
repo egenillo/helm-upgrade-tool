@@ -26,11 +26,6 @@ Semantic, noise-filtered, risk-aware diffs for Helm upgrades.
 pip install -e .
 ```
 
-For development:
-
-```bash
-pip install -e ".[dev]"
-```
 
 ## Usage
 
@@ -245,6 +240,31 @@ helm-preview diff demo-release ./demo/demo-app -n default -f ./demo/values-upgra
 # Using python -m instead of the entry point
 python -m helm_preview diff demo-release ./demo/demo-app -n default -f ./demo/values-upgrade.yaml
 ```
+
+
+The <CHART> argument points to the entire chart directory, not just values. The underlying command is:
+
+  helm upgrade <release> <chart> --dry-run                                                                                                                                                                                                   
+  Helm renders all templates in the chart against the provided values, so any change is captured:                                                                                                                                            
+  - Modified templates (e.g. adding a new container, changing a label)
+  - New template files (e.g. adding ingress.yaml results in an ADDED resource)
+  - Deleted template files (results in a REMOVED resource)
+  - Changes to Chart.yaml (appVersion, dependencies)
+  - Changes to helpers (_helpers.tpl)
+  - Changes to default values.yaml inside the chart
+
+
+### When the upgrade include several changes in files of the helm chart
+
+  The demo uses -f values-upgrade.yaml because that's the most common upgrade scenario where only the values file changed, demo-app folder is used to deploy the first version but is also used to compare as the new version.
+   
+  If you have a new helm chart for the upgrade where not only the values file changed then you can run:
+
+  ```bash
+  helm-preview diff demo-release ./demo/demo-app-v2 -n default
+  ```
+
+  where demo-app-v2 is the new version of the chart — no -f flag needed. You can also combine both: a modified chart and a values override file together.
 
 ### Positional arguments
 
