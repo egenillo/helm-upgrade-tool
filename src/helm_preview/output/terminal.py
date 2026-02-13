@@ -38,6 +38,7 @@ def render_terminal(
     show_all: bool = False,
     no_color: bool = False,
     risk_only: bool = False,
+    crd_report: "CrdReport | None" = None,
 ) -> None:
     """Print colored diff to terminal."""
     console = Console(no_color=no_color)
@@ -48,14 +49,18 @@ def render_terminal(
             if any(a.level in (RiskLevel.WARNING, RiskLevel.DANGER) for a in ra)
         ]
 
-    if not results:
+    if not results and not crd_report:
         console.print("[dim]No changes detected.[/dim]")
         return
 
     for change, risk_annotations, ownership in results:
         _render_resource(console, change, risk_annotations, ownership)
 
-    _render_summary(console, results)
+    # Render CRD analysis section if present
+    if crd_report:
+        _render_crd_section(console, crd_report)
+
+    _render_summary(console, results, crd_report=crd_report)
 
 
 def _render_resource(
@@ -162,9 +167,112 @@ def _max_risk(annotations: list[RiskAnnotation]) -> RiskLevel | None:
     return max(annotations, key=lambda a: order[a.level]).level
 
 
+def _render_crd_section(console: Console, crd_report: "CrdReport") -> None:
+    """Render the CRD Analysis section."""
+    from helm_preview.crd.report import CrdReport
+
+    console.print()
+    console.rule("[bold cyan]CRD Analysis[/bold cyan]")
+    console.print()
+
+    # CRD changes table
+    if crd_report.crds:
+        table = Table(title="CRD Changes", show_header=True)
+        table.add_column("CRD Name", style="bold")
+        table.add_column("Status")
+        table.add_column("Risk")
+        table.add_column("Details")
+
+        for crd in crd_report.crds:
+            status_label, status_style = STATUS_STYLES.get(
+                crd.status, ("UNKNOWN", "dim")
+            )
+            risk_label, risk_style = RISK_STYLES.get(
+                crd.max_risk, ("SAFE", "green")
+            )
+            details = f"{len(crd.changes)} change(s)" if crd.changes else ""
+            table.add_row(
+                crd.name,
+                f"[{status_style}]{status_label}[/{status_style}]",
+                f"[{risk_style}]{risk_label}[/{risk_style}]",
+                details,
+            )
+
+        console.print(table)
+        console.print()
+
+    # New CRDs
+    if crd_report.new_crds:
+        console.print("[bold green]New CRDs:[/bold green]")
+        for new_crd in crd_report.new_crds:
+            versions_str = ", ".join(new_crd.versions)
+            console.print(
+                f"  + {new_crd.name} ({new_crd.kind}) "
+                f"[dim]versions: {versions_str}[/dim]"
+            )
+        console.print()
+
+    # Ownership conflicts
+    conflicts = [c for c in crd_report.crds if c.ownership_conflict]
+    if conflicts:
+        console.print("[bold yellow]Ownership Conflicts:[/bold yellow]")
+        for crd in conflicts:
+            console.print(f"  [yellow]![/yellow] {crd.ownership_conflict}")
+        console.print()
+
+    # Stored-version warnings
+    sv_warnings = [
+        (c.name, w)
+        for c in crd_report.crds
+        for w in c.stored_version_warnings
+    ]
+    if sv_warnings:
+        console.print("[bold yellow]Stored Version Warnings:[/bold yellow]")
+        for name, warning in sv_warnings:
+            console.print(f"  [yellow]![/yellow] {name}: {warning}")
+        console.print()
+
+    # Schema validation issues
+    schema_errors = [
+        (c.name, e)
+        for c in crd_report.crds
+        for e in c.schema_validation_errors
+    ]
+    if schema_errors:
+        console.print("[bold red]Schema Validation Issues:[/bold red]")
+        for name, error in schema_errors:
+            console.print(f"  [red]!![/red] {name}: {error}")
+        console.print()
+
+    # Risk details for each CRD
+    for crd in crd_report.crds:
+        if crd.risk_annotations:
+            for annotation in crd.risk_annotations:
+                risk_label, risk_style = RISK_STYLES[annotation.level]
+                console.print(
+                    f"  [{risk_style}]{risk_label}[/{risk_style}] "
+                    f"{crd.name}: {annotation.message}"
+                )
+
+    # General warnings
+    for warning in crd_report.warnings:
+        console.print(f"  [dim]Warning: {warning}[/dim]")
+
+    # Policy decision
+    if crd_report.policy_result:
+        pr = crd_report.policy_result
+        if pr.blocked:
+            console.print(f"\n  [red bold]{pr.message}[/red bold]")
+        else:
+            console.print(f"\n  [dim]{pr.message}[/dim]")
+
+    console.print()
+
+
 def _render_summary(
     console: Console,
     results: list[tuple[ChangeRecord, list[RiskAnnotation], OwnershipInfo | None]],
+    crd_report: "CrdReport | None" = None,
 ) -> None:
     """Render summary table at the bottom."""
     added = sum(1 for cr, _, _ in results if cr.status == "added")
@@ -185,5 +293,13 @@ def _render_summary(
         table.add_row("[yellow]Warnings[/yellow]", str(warnings))
     if dangers:
         table.add_row("[red bold]Dangers[/red bold]", str(dangers))
+
+    if crd_report:
+        crd_changed = sum(1 for c in crd_report.crds if c.status == "changed")
+        crd_new = len(crd_report.new_crds)
+        if crd_changed or crd_new:
+            table.add_row("[cyan]CRDs Changed[/cyan]", str(crd_changed))
+            if crd_new:
+                table.add_row("[cyan]CRDs New[/cyan]", str(crd_new))
 
     console.print(table)

@@ -13,6 +13,7 @@ from helm_preview.diff.engine import ChangeRecord
 def render_json(
     results: list[tuple[ChangeRecord, list[RiskAnnotation], OwnershipInfo | None]],
     total_unchanged: int = 0,
+    crd_report: "CrdReport | None" = None,
 ) -> str:
     """Produce structured JSON output."""
     added = sum(1 for cr, _, _ in results if cr.status == "added")
@@ -76,6 +77,10 @@ def render_json(
             ]
 
         output["changes"].append(change_obj)
+
+    # Add CRD analysis if present
+    if crd_report:
+        output["crd_analysis"] = crd_report.to_dict()
 
     return json.dumps(output, indent=2, default=str)
 

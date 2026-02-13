@@ -17,6 +17,7 @@ from helm_preview.output.json_out import render_json
 from helm_preview.output.terminal import render_terminal
 from helm_preview.parser.manifest import (
     Resource,
+    ResourcePair,
     parse_multi_doc,
     pair_resources,
 )
@@ -49,6 +50,13 @@ def main() -> None:
 @click.option("--kube-context", default=None, help="Kubernetes context to use")
 @click.option("--no-color", is_flag=True, help="Disable colored output")
 @click.option("--risk-only", is_flag=True, help="Only show WARNING/DANGER changes")
+@click.option("--check-crds", is_flag=True, help="Enable CRD analysis")
+@click.option(
+    "--crd-policy",
+    type=click.Choice(["ignore", "warn", "fail"]),
+    default="warn",
+    help="CRD policy: ignore | warn | fail (default: warn)",
+)
 def diff(
     release: str,
     chart: str,
@@ -65,6 +73,8 @@ def diff(
     kube_context: str | None,
     no_color: bool,
     risk_only: bool,
+    check_crds: bool,
+    crd_policy: str,
 ) -> None:
     """Preview the diff of a Helm upgrade."""
     ns = namespace or "default"
@@ -95,9 +105,19 @@ def diff(
         # 4. Parse & pair
         pairs = pair_resources(live_resources, upgrade_resources)
 
+        # 4b. If --check-crds, separate CRD pairs from non-CRD pairs
+        crd_report = None
+        if check_crds:
+            non_crd_pairs = [p for p in pairs if not _is_crd_pair(p)]
+            crd_report = _run_crd_analysis(
+                upgrade_resources, chart, crd_policy, release, **kube_opts
+            )
+        else:
+            non_crd_pairs = pairs
+
         # 5-6. Filter, normalize & diff
         change_records = diff_all(
-            pairs,
+            non_crd_pairs,
             show_all=show_all,
             extra_ignores=list(ignore_path) if ignore_path else None,
         )
@@ -112,11 +132,13 @@ def diff(
             full_results.append((change, risk_annotations, ownership))
 
         # Count unchanged for JSON output
-        total_unchanged = sum(1 for p in pairs if p.status == "unchanged")
+        total_unchanged = sum(1 for p in non_crd_pairs if p.status == "unchanged")
 
         # 8. Output
         if output_format == "json":
-            click.echo(render_json(full_results, total_unchanged=total_unchanged))
+            click.echo(render_json(
+                full_results, total_unchanged=total_unchanged, crd_report=crd_report
+            ))
         else:
             render_terminal(
                 full_results,
@@ -124,11 +146,43 @@ def diff(
                 show_all=show_all,
                 no_color=no_color,
                 risk_only=risk_only,
+                crd_report=crd_report,
             )
+
+        # Exit non-zero if CRD policy blocks
+        if crd_report and crd_report.policy_result and crd_report.policy_result.blocked:
+            sys.exit(1)
 
     except RunError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+def _is_crd_pair(pair: ResourcePair) -> bool:
+    """Check if a resource pair involves a CRD."""
+    res = pair.new or pair.old
+    return res is not None and res.kind == "CustomResourceDefinition"
+
+
+def _run_crd_analysis(
+    upgrade_resources: list[Resource],
+    chart_path: str,
+    crd_policy: str,
+    release_name: str,
+    **kube_opts: str | None,
+) -> "CrdReport":
+    """Run the CRD analysis pipeline."""
+    from helm_preview.crd.pipeline import run_crd_pipeline
+    from helm_preview.crd.policy import CrdPolicyMode
+
+    policy_mode = CrdPolicyMode(crd_policy)
+    return run_crd_pipeline(
+        upgrade_resources=upgrade_resources,
+        chart_path=chart_path,
+        policy_mode=policy_mode,
+        release_name=release_name,
+        **kube_opts,
+    )
 
 
 def _apply_server_side(
