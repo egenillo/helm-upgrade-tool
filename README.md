@@ -1,4 +1,4 @@
-# helm-preview
+# helm-upgrade-tool
 
 Semantic, noise-filtered, risk-aware diffs for Helm upgrades.
 
