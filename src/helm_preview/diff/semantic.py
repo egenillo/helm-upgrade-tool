@@ -20,17 +20,18 @@ def _deep_semantic_equal(a: object, b: object) -> bool:
     if a == b:
         return True
 
-    # None vs missing: treat None as equal to absent
-    if a is None and b is None:
-        return True
+    # Coercion only applies across types (string vs scalar). Two strings are
+    # compared literally: "1.10" vs "1.1" or "yes" vs "true" are real changes.
+    if isinstance(a, str) != isinstance(b, str):
+        # Numeric coercion: "80" == 80
+        num_a, num_b = _coerce_numeric(a), _coerce_numeric(b)
+        if num_a is not None and num_b is not None:
+            return num_a == num_b
 
-    # Numeric coercion: "80" == 80
-    if _coerce_numeric(a) is not None and _coerce_numeric(b) is not None:
-        return _coerce_numeric(a) == _coerce_numeric(b)
-
-    # Boolean coercion: "true" == True
-    if _coerce_bool(a) is not None and _coerce_bool(b) is not None:
-        return _coerce_bool(a) == _coerce_bool(b)
+        # Boolean coercion: "true" == True
+        bool_a, bool_b = _coerce_bool(a), _coerce_bool(b)
+        if bool_a is not None and bool_b is not None:
+            return bool_a == bool_b
 
     # Dict comparison
     if isinstance(a, dict) and isinstance(b, dict):

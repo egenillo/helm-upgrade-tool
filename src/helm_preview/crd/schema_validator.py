@@ -46,7 +46,7 @@ def _validate_object(value: Any, schema: dict, path: str) -> list[str]:
     if "pattern" in schema and isinstance(value, str):
         import re
         try:
-            if not re.match(schema["pattern"], value):
+            if not re.search(schema["pattern"], value):
                 errors.append(f"At '{path}': value '{value}' does not match pattern '{schema['pattern']}'")
         except re.error:
             pass

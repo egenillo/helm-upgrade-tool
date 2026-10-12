@@ -50,13 +50,18 @@ def check_service_type_change(change: ChangeRecord) -> list[RiskAnnotation]:
     annotations: list[RiskAnnotation] = []
     for fc in change.changes:
         if fc.path == "spec.type":
+            # An absent type defaults to ClusterIP
+            old_type = fc.old_value or "ClusterIP"
+            new_type = fc.new_value or "ClusterIP"
+            if old_type == new_type:
+                continue
             level = RiskLevel.WARNING
-            if fc.old_value == "ClusterIP" and fc.new_value in ("NodePort", "LoadBalancer"):
+            if old_type == "ClusterIP" and new_type in ("NodePort", "LoadBalancer"):
                 level = RiskLevel.DANGER
             annotations.append(RiskAnnotation(
                 level=level,
                 rule="service_type_change",
-                message=f"Service type changed from {fc.old_value} to {fc.new_value}",
+                message=f"Service type changed from {old_type} to {new_type}",
                 path=fc.path,
             ))
     return annotations
@@ -86,14 +91,31 @@ def check_pvc_changes(change: ChangeRecord) -> list[RiskAnnotation]:
     return annotations
 
 
+# Kinds whose deletion destroys data beyond the resource itself
+DESTRUCTIVE_DELETIONS = {
+    "PersistentVolumeClaim": "its data may be lost",
+    "Namespace": "everything inside it will be deleted",
+    "CustomResourceDefinition": "all of its custom resources will be deleted",
+}
+
+
 def check_resource_deletion(change: ChangeRecord) -> list[RiskAnnotation]:
-    """Any removed resource gets at least WARNING."""
+    """Removed resources: WARNING, DANGER if data is lost, SAFE if helm keeps them."""
     if change.status != "removed":
         return []
+    target = f"{change.kind}/{change.name}"
+    if change.kept_on_removal:
+        return [RiskAnnotation(
+            level=RiskLevel.SAFE,
+            rule="resource_kept",
+            message=f"{target} leaves the chart but stays in the cluster (helm.sh/resource-policy: keep)",
+            path="",
+        )]
+    consequence = DESTRUCTIVE_DELETIONS.get(change.kind)
     return [RiskAnnotation(
-        level=RiskLevel.WARNING,
+        level=RiskLevel.DANGER if consequence else RiskLevel.WARNING,
         rule="resource_deleted",
-        message=f"{change.kind}/{change.name} will be removed",
+        message=f"{target} will be removed" + (f"; {consequence}" if consequence else ""),
         path="",
     )]
 
@@ -135,6 +157,30 @@ def check_rbac_escalation(change: ChangeRecord) -> list[RiskAnnotation]:
     return annotations
 
 
+def check_rbac_binding_changes(change: ChangeRecord) -> list[RiskAnnotation]:
+    """RoleBinding/ClusterRoleBinding: roleRef is immutable, subjects grant access."""
+    if change.kind not in ("RoleBinding", "ClusterRoleBinding"):
+        return []
+
+    annotations: list[RiskAnnotation] = []
+    for fc in change.changes:
+        if fc.path.startswith("roleRef"):
+            annotations.append(RiskAnnotation(
+                level=RiskLevel.DANGER,
+                rule="rbac_roleref_change",
+                message=f"roleRef is immutable; the upgrade of {change.kind}/{change.name} will fail",
+                path=fc.path,
+            ))
+        elif fc.path.startswith("subjects"):
+            annotations.append(RiskAnnotation(
+                level=RiskLevel.WARNING,
+                rule="rbac_binding_change",
+                message=f"Subjects changed at '{fc.path}' on {change.kind}/{change.name}",
+                path=fc.path,
+            ))
+    return annotations
+
+
 # Rules registry
 RISK_RULES: list[Callable[[ChangeRecord], list[RiskAnnotation]]] = [
     check_immutable_fields,
@@ -143,6 +189,7 @@ RISK_RULES: list[Callable[[ChangeRecord], list[RiskAnnotation]]] = [
     check_resource_deletion,
     check_crd_changes,
     check_rbac_escalation,
+    check_rbac_binding_changes,
 ]
 
 

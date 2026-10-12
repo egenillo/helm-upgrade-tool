@@ -40,26 +40,43 @@ def _remove_path(obj: dict, path: str) -> None:
     _remove_path_parts(obj, parts)
 
 
+def _is_glob(segment: str) -> bool:
+    return "*" in segment or "?" in segment or "[" in segment
+
+
 def _remove_path_parts(obj: object, parts: list[str]) -> None:
-    """Recursively walk into obj following parts, removing the leaf."""
-    if not parts or not isinstance(obj, dict):
+    """Recursively walk into obj following parts, removing the leaf.
+
+    Any segment may be a glob (dict keys) or '*' / an index (list items).
+    """
+    if not parts:
         return
 
-    key = parts[0]
-    remaining = parts[1:]
+    key, remaining = parts[0], parts[1:]
 
-    if not remaining:
-        # Leaf: remove matching keys (supports glob)
-        if '*' in key or '?' in key or '[' in key:
-            to_remove = [k for k in obj if fnmatch.fnmatch(k, key)]
-            for k in to_remove:
-                del obj[k]
-        elif key in obj:
-            del obj[key]
-    else:
-        # Intermediate: recurse
-        if key in obj and isinstance(obj[key], dict):
-            _remove_path_parts(obj[key], remaining)
+    if isinstance(obj, list):
+        if key == "*":
+            targets = obj
+        elif key.isdigit() and int(key) < len(obj):
+            targets = [obj[int(key)]]
+        else:
+            return
+        if remaining:
+            for item in targets:
+                _remove_path_parts(item, remaining)
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    matches = [k for k in obj if fnmatch.fnmatchcase(str(k), key)] if _is_glob(key) else (
+        [key] if key in obj else []
+    )
+    for k in matches:
+        if remaining:
+            _remove_path_parts(obj[k], remaining)
+        else:
+            del obj[k]
 
 
 def normalize_body(body: dict) -> dict:
@@ -110,9 +127,5 @@ def _sort_list_at_path(obj: object, parts: list[str], sort_key: str) -> None:
     elif isinstance(obj, list):
         # * wildcard matches each list element
         if parts[0] == "*":
-            remaining = parts[1:]
             for item in obj:
-                if remaining:
-                    _sort_list_at_path(item, remaining, sort_key)
-                    continue
-                # If no remaining parts, this list element is the target
+                _sort_list_at_path(item, parts[1:], sort_key)

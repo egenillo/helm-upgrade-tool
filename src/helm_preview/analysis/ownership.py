@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from helm_preview.parser.manifest import Resource
 
@@ -12,46 +12,47 @@ class OwnershipInfo:
     manager: str  # "helm", "argocd", "flux", "unknown"
     release: str | None = None
     app: str | None = None
-    warnings: list[str] = field(default_factory=list)
 
 
 def detect_ownership(resource: Resource) -> OwnershipInfo:
     """Check annotations/labels to determine resource ownership.
 
-    Checks:
-    - app.kubernetes.io/managed-by
-    - meta.helm.sh/release-name
-    - argocd.argoproj.io/managed-by
-    - fluxcd.io/sync-checksum / kustomize.toolkit.fluxcd.io/*
-    """
-    metadata = resource.body.get("metadata", {})
-    labels = metadata.get("labels", {})
-    annotations = metadata.get("annotations", {})
+    GitOps controllers are checked before Helm: ArgoCD and Flux both render
+    Helm charts, so their resources usually also carry
+    app.kubernetes.io/managed-by=Helm.
 
-    managed_by = labels.get("app.kubernetes.io/managed-by", "")
+    Checks:
+    - argocd.argoproj.io/tracking-id (annotation) / argocd.argoproj.io/instance (label)
+    - *.toolkit.fluxcd.io/* and fluxcd.io/* labels/annotations
+    - app.kubernetes.io/managed-by / meta.helm.sh/release-name
+    """
+    metadata = resource.body.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+
+    # ArgoCD detection (tracking-id format: "<app>:<group>/<kind>:<ns>/<name>")
+    argocd_app = labels.get("argocd.argoproj.io/instance")
+    tracking_id = annotations.get("argocd.argoproj.io/tracking-id")
+    if not argocd_app and isinstance(tracking_id, str):
+        argocd_app = tracking_id.split(":", 1)[0]
+    if argocd_app:
+        return OwnershipInfo(
+            manager="argocd",
+            app=str(argocd_app),
+        )
+
+    # Flux detection
+    flux_keys = [k for k in (*annotations, *labels) if "fluxcd.io" in k]
+    if flux_keys:
+        return OwnershipInfo(manager="flux")
 
     # Helm detection
+    managed_by = str(labels.get("app.kubernetes.io/managed-by") or "")
     helm_release = annotations.get("meta.helm.sh/release-name")
     if managed_by.lower() == "helm" or helm_release:
         return OwnershipInfo(
             manager="helm",
             release=helm_release or labels.get("app.kubernetes.io/instance"),
         )
-
-    # ArgoCD detection
-    argocd_app = annotations.get("argocd.argoproj.io/managed-by")
-    if not argocd_app:
-        argocd_app = labels.get("argocd.argoproj.io/instance")
-    if argocd_app:
-        return OwnershipInfo(
-            manager="argocd",
-            app=argocd_app,
-        )
-
-    # Flux detection
-    flux_keys = [k for k in annotations if "fluxcd.io" in k or "kustomize.toolkit.fluxcd.io" in k]
-    flux_labels = [k for k in labels if "fluxcd.io" in k or "kustomize.toolkit.fluxcd.io" in k]
-    if flux_keys or flux_labels:
-        return OwnershipInfo(manager="flux")
 
     return OwnershipInfo(manager="unknown")

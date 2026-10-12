@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import click
-
 from helm_preview.crd.classifier import classify_crd_changes
 from helm_preview.crd.detect_new import detect_new_crds
 from helm_preview.crd.differ import diff_crds, pair_crds
@@ -41,28 +39,38 @@ def run_crd_pipeline(
     """
     report = CrdReport()
 
-    # Step 1: Extract proposed CRDs
+    # Step 1: Extract proposed CRDs. Only templated CRDs are part of the
+    # upgrade: Helm never upgrades (or installs on upgrade) CRDs from crds/.
     proposed_crds = extract_crds_from_resources(upgrade_resources)
     if chart_path:
-        chart_crds = extract_crds_from_chart_dir(chart_path)
-        # Merge, preferring resources from upgrade (they may be templated)
-        existing_names = {r.name for r in proposed_crds}
-        for c in chart_crds:
-            if c.name not in existing_names:
-                proposed_crds.append(c)
+        templated_names = {r.name for r in proposed_crds}
+        skipped = [c.name for c in extract_crds_from_chart_dir(chart_path)
+                   if c.name not in templated_names]
+        if skipped:
+            report.warnings.append(
+                f"Chart crds/ directory contains {len(skipped)} CRD(s) that "
+                f"'helm upgrade' will NOT apply: {', '.join(skipped)}. "
+                f"Upgrade them manually (e.g. kubectl apply) if needed."
+            )
 
     if not proposed_crds:
         report.policy_result = evaluate_policy(report, policy_mode)
         return report
 
     # Step 2: Discover installed CRDs
-    installed_crds = discover_cluster_crds(**kube_opts)
-    if not installed_crds:
+    installed_crds = discover_cluster_crds(
+        names=sorted({r.name for r in proposed_crds}), **kube_opts
+    )
+    if installed_crds is None:
+        # Comparing against an empty set would report every CRD as new
+        report.discovery_failed = True
         report.warnings.append(
             "Could not retrieve installed CRDs from cluster "
             "(permission denied or cluster unreachable). "
-            "Comparing against empty set."
+            "CRD comparison skipped."
         )
+        report.policy_result = evaluate_policy(report, policy_mode)
+        return report
 
     # Filter installed CRDs to only those relevant (same names as proposed)
     proposed_names = {r.name for r in proposed_crds}
@@ -80,6 +88,8 @@ def run_crd_pipeline(
 
     # Step 5-9: Process each pair
     for pair, changes in diff_results:
+        if pair.status == "added":
+            continue  # reported once, under new_crds
         crd_name = (pair.new or pair.old).name  # type: ignore[union-attr]
         detail = CrdChangeDetail(
             name=crd_name,
@@ -133,11 +143,8 @@ def _validate_live_crs(
     if not plural or not group:
         return
 
-    crs = fetch_custom_resources(plural, group, **kube_opts)
-    if not crs:
-        return
-
-    # Find the storage version schema
+    # Validate against the storage version's schema, and ask the API server
+    # for objects in that same version
     versions = spec.get("versions", [])
     storage_version = None
     for v in versions:
@@ -150,6 +157,10 @@ def _validate_live_crs(
 
     schema = find_schema_for_version(new_crd.body, storage_version)
     if not schema:
+        return
+
+    crs = fetch_custom_resources(plural, group, storage_version, **kube_opts)
+    if not crs:
         return
 
     errors = validate_crs_against_schema(crs, schema)

@@ -57,6 +57,7 @@ class CrdReport:
     new_crds: list[NewCrdInfo] = field(default_factory=list)
     policy_result: PolicyResult | None = None
     warnings: list[str] = field(default_factory=list)
+    discovery_failed: bool = False  # installed CRDs could not be listed
 
     @property
     def has_issues(self) -> bool:
@@ -77,6 +78,7 @@ class CrdReport:
             "crds": [],
             "new_crds": [],
             "warnings": self.warnings,
+            "discovery_failed": self.discovery_failed,
         }
 
         for crd in self.crds:

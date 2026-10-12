@@ -1,14 +1,12 @@
-"""Structural YAML diff engine using deepdiff."""
+"""Structural YAML diff engine."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from deepdiff import DeepDiff
-
 from helm_preview.diff.filters import normalize_body, strip_noise
-from helm_preview.diff.semantic import is_semantically_equal
+from helm_preview.diff.semantic import _deep_semantic_equal, is_semantically_equal
 from helm_preview.parser.manifest import ResourcePair
 
 
@@ -28,6 +26,13 @@ class ChangeRecord:
     namespace: str
     status: Literal["added", "removed", "changed"]
     changes: list[FieldChange] = field(default_factory=list)
+    # Removed from the chart, but helm.sh/resource-policy: keep leaves it in the cluster
+    kept_on_removal: bool = False
+
+
+def _keeps_on_removal(res: Any) -> bool:
+    annotations = (res.body.get("metadata") or {}).get("annotations") or {}
+    return annotations.get("helm.sh/resource-policy") == "keep"
 
 
 def compute_diff(
@@ -62,6 +67,7 @@ def compute_diff(
             name=res.name,
             namespace=res.namespace,
             status="removed",
+            kept_on_removal=_keeps_on_removal(res),
         )
 
     # status == "changed"
@@ -80,102 +86,135 @@ def compute_diff(
     if is_semantically_equal(old_body, new_body):
         return None
 
-    dd = DeepDiff(old_body, new_body, verbose_level=2)
-
-    changes = _extract_changes(dd)
+    changes = diff_values(old_body, new_body)
 
     if not changes:
         return None
 
+    if pair.new.kind == "Secret":
+        changes = [_redact_secret_change(fc) for fc in changes]
+
     return ChangeRecord(
-        resource_key=pair.old.key,
-        kind=pair.old.kind,
-        name=pair.old.name,
-        namespace=pair.old.namespace,
+        resource_key=pair.new.key,
+        kind=pair.new.kind,
+        name=pair.new.name,
+        namespace=pair.new.namespace,
         status="changed",
         changes=changes,
     )
 
 
-def _extract_changes(dd: DeepDiff) -> list[FieldChange]:
-    """Convert DeepDiff output to FieldChange list."""
+REDACTED = "<redacted>"
+
+# Secret paths whose values must never be printed. The last-applied annotation
+# embeds the full Secret body, so it is just as sensitive as data/stringData.
+_SECRET_SENSITIVE_PREFIXES = (
+    "data",
+    "stringData",
+    "metadata.annotations.kubectl\\.kubernetes\\.io/last-applied-configuration",
+)
+
+
+def _redact_secret_change(fc: FieldChange) -> FieldChange:
+    """Replace Secret payload values with a placeholder, keeping the path."""
+    if not any(
+        fc.path == p or fc.path.startswith(p + ".") or fc.path.startswith(p + "[")
+        for p in _SECRET_SENSITIVE_PREFIXES
+    ):
+        return fc
+    return FieldChange(
+        path=fc.path,
+        old_value=_redact_value(fc.old_value),
+        new_value=_redact_value(fc.new_value),
+        change_type=fc.change_type,
+    )
+
+
+def _redact_value(value: Any) -> Any:
+    """Redact leaf values, keeping dict keys so users can see what changed."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    return REDACTED
+
+
+def diff_values(old: Any, new: Any, path: str = "") -> list[FieldChange]:
+    """Structural diff of two YAML values into FieldChanges.
+
+    Dict keys are joined with '.', list items are addressed as '[i]'. Lists of
+    dicts that all carry a unique string 'name' (containers, env, volumes, CRD
+    versions, ...) are matched by name instead of position, so inserting or
+    removing one item does not shift the diff of its neighbours. Pure
+    reordering of such lists is not reported.
+    """
+    if isinstance(old, dict) and isinstance(new, dict):
+        return _diff_dicts(old, new, path)
+    if isinstance(old, list) and isinstance(new, list):
+        if _is_keyed_list(old) and _is_keyed_list(new):
+            return _diff_keyed_lists(old, new, path)
+        return _diff_positional_lists(old, new, path)
+    one_is_bool = isinstance(old, bool) != isinstance(new, bool)
+    has_str = isinstance(old, str) or isinstance(new, str)
+    # Equivalent after coercion (e.g. "80" vs 80), but True is not 1
+    if (not one_is_bool or has_str) and _deep_semantic_equal(old, new):
+        return []
+    change_type = "type_changed" if type(old) is not type(new) else "value_changed"
+    return [FieldChange(path=path, old_value=old, new_value=new, change_type=change_type)]
+
+
+def _join_key(path: str, key: Any) -> str:
+    """Append a dict key; dots in keys are escaped so paths work with --ignore-path."""
+    key = str(key).replace(".", "\\.")
+    return f"{path}.{key}" if path else key
+
+
+def _diff_dicts(old: dict, new: dict, path: str) -> list[FieldChange]:
     changes: list[FieldChange] = []
-
-    for path, detail in dd.get("values_changed", {}).items():
-        changes.append(FieldChange(
-            path=_deepdiff_path_to_dot(path),
-            old_value=detail.get("old_value"),
-            new_value=detail.get("new_value"),
-            change_type="value_changed",
-        ))
-
-    for path, detail in dd.get("type_changes", {}).items():
-        changes.append(FieldChange(
-            path=_deepdiff_path_to_dot(path),
-            old_value=detail.get("old_value"),
-            new_value=detail.get("new_value"),
-            change_type="type_changed",
-        ))
-
-    for path, value in dd.get("dictionary_item_added", {}).items():
-        changes.append(FieldChange(
-            path=_deepdiff_path_to_dot(path),
-            old_value=None,
-            new_value=value,
-            change_type="item_added",
-        ))
-
-    for path, value in dd.get("dictionary_item_removed", {}).items():
-        changes.append(FieldChange(
-            path=_deepdiff_path_to_dot(path),
-            old_value=value,
-            new_value=None,
-            change_type="item_removed",
-        ))
-
-    for path, value in dd.get("iterable_item_added", {}).items():
-        changes.append(FieldChange(
-            path=_deepdiff_path_to_dot(path),
-            old_value=None,
-            new_value=value,
-            change_type="item_added",
-        ))
-
-    for path, value in dd.get("iterable_item_removed", {}).items():
-        changes.append(FieldChange(
-            path=_deepdiff_path_to_dot(path),
-            old_value=value,
-            new_value=None,
-            change_type="item_removed",
-        ))
-
+    for key, value in old.items():
+        if key not in new:
+            if value is not None:  # null and missing are equivalent
+                changes.append(FieldChange(_join_key(path, key), value, None, "item_removed"))
+        else:
+            changes.extend(diff_values(value, new[key], _join_key(path, key)))
+    for key, value in new.items():
+        if key not in old and value is not None:
+            changes.append(FieldChange(_join_key(path, key), None, value, "item_added"))
     return changes
 
 
-def _deepdiff_path_to_dot(path: str) -> str:
-    """Convert DeepDiff path like root['spec']['replicas'] to spec.replicas."""
-    # Remove root prefix
-    path = path.replace("root", "", 1)
-    # Convert ['key'] to .key and [0] to [0]
-    result = ""
-    i = 0
-    while i < len(path):
-        if path[i] == "[":
-            end = path.index("]", i)
-            inner = path[i + 1 : end]
-            if inner.startswith("'") or inner.startswith('"'):
-                # Dict key
-                key = inner.strip("'\"")
-                if result:
-                    result += "."
-                result += key
-            else:
-                # List index
-                result += f"[{inner}]"
-            i = end + 1
+def _diff_positional_lists(old: list, new: list, path: str) -> list[FieldChange]:
+    changes: list[FieldChange] = []
+    for i, (o, n) in enumerate(zip(old, new)):
+        changes.extend(diff_values(o, n, f"{path}[{i}]"))
+    for i in range(len(new), len(old)):
+        changes.append(FieldChange(f"{path}[{i}]", old[i], None, "item_removed"))
+    for i in range(len(old), len(new)):
+        changes.append(FieldChange(f"{path}[{i}]", None, new[i], "item_added"))
+    return changes
+
+
+def _is_keyed_list(items: list) -> bool:
+    """True if items are dicts with unique string 'name' values."""
+    if not items or not all(isinstance(i, dict) and isinstance(i.get("name"), str) for i in items):
+        return False
+    return len({i["name"] for i in items}) == len(items)
+
+
+def _diff_keyed_lists(old: list, new: list, path: str) -> list[FieldChange]:
+    changes: list[FieldChange] = []
+    old_by_name = {item["name"]: item for item in old}
+    for new_idx, item in enumerate(new):
+        item_path = f"{path}[{new_idx}]"
+        if item["name"] in old_by_name:
+            changes.extend(diff_values(old_by_name[item["name"]], item, item_path))
         else:
-            i += 1
-    return result
+            changes.append(FieldChange(item_path, None, item, "item_added"))
+    new_names = {item["name"] for item in new}
+    for old_idx, item in enumerate(old):
+        if item["name"] not in new_names:
+            changes.append(FieldChange(f"{path}[{old_idx}]", item, None, "item_removed"))
+    return changes
 
 
 def diff_all(

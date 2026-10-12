@@ -2,26 +2,10 @@
 
 from __future__ import annotations
 
-from helm_preview.diff.engine import FieldChange, _deepdiff_path_to_dot, _extract_changes
+from helm_preview.diff.engine import FieldChange, diff_values
 from helm_preview.diff.filters import normalize_body, strip_noise
 from helm_preview.diff.semantic import is_semantically_equal
 from helm_preview.parser.manifest import Resource, ResourcePair
-
-from deepdiff import DeepDiff
-
-# Additional noise paths specific to CRDs (status, timestamps, etc.)
-CRD_NOISE_PATHS = [
-    "status",
-    "metadata.creationTimestamp",
-    "metadata.resourceVersion",
-    "metadata.uid",
-    "metadata.generation",
-    "metadata.managedFields",
-    "metadata.annotations.meta\\.helm\\.sh/*",
-    "metadata.annotations.kubectl\\.kubernetes\\.io/last-applied-configuration",
-    "metadata.labels.helm\\.sh/chart",
-]
-
 
 def pair_crds(
     installed: list[Resource], proposed: list[Resource]
@@ -68,8 +52,8 @@ def diff_crds(pairs: list[ResourcePair]) -> list[tuple[ResourcePair, list[FieldC
             continue
 
         assert pair.old is not None and pair.new is not None
-        old_body = strip_noise(pair.old.body, CRD_NOISE_PATHS)
-        new_body = strip_noise(pair.new.body, CRD_NOISE_PATHS)
+        old_body = strip_noise(pair.old.body)
+        new_body = strip_noise(pair.new.body)
 
         old_body = normalize_body(old_body)
         new_body = normalize_body(new_body)
@@ -77,8 +61,7 @@ def diff_crds(pairs: list[ResourcePair]) -> list[tuple[ResourcePair, list[FieldC
         if is_semantically_equal(old_body, new_body):
             continue
 
-        dd = DeepDiff(old_body, new_body, verbose_level=2)
-        changes = _extract_changes(dd)
+        changes = diff_values(old_body, new_body)
 
         if changes:
             results.append((pair, changes))

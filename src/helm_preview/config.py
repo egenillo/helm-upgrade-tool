@@ -17,11 +17,15 @@ NOISE_PATHS: set[str] = {
 
 # Known immutable fields per Kind (lowercase kind → list of dot-paths)
 IMMUTABLE_FIELDS: dict[str, list[str]] = {
-    "deployment": ["spec.selector.matchLabels"],
+    "deployment": ["spec.selector"],
+    "daemonset": ["spec.selector"],
     "service": ["spec.clusterIP"],
-    "persistentvolumeclaim": ["spec.storageClassName"],
-    "job": ["spec.selector"],
-    "statefulset": ["spec.volumeClaimTemplates"],
+    "persistentvolumeclaim": ["spec.storageClassName", "spec.accessModes", "spec.volumeName"],
+    "job": ["spec.selector", "spec.template"],
+    "statefulset": [
+        "spec.selector", "spec.serviceName", "spec.podManagementPolicy",
+        "spec.volumeClaimTemplates",
+    ],
 }
 
 # Lists that should be sorted by a known key before comparison
@@ -37,6 +41,3 @@ UNORDERED_LIST_SORT_KEYS: dict[str, str] = {
 
 # Default subprocess timeout in seconds
 DEFAULT_TIMEOUT = 60
-
-# Default context lines for diff output
-DEFAULT_CONTEXT_LINES = 3

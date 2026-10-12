@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import sys
+from typing import TYPE_CHECKING
 
 import click
 import yaml
 
 from helm_preview.analysis.ownership import OwnershipInfo, detect_ownership
-from helm_preview.analysis.risk import RiskAnnotation, assess_risk
+from helm_preview.analysis.risk import RiskAnnotation, RiskLevel, assess_risk
 from helm_preview.core.helm import dry_run_upgrade, get_manifest
-from helm_preview.core.kubectl import server_side_dry_run
+from helm_preview.core.kubectl import current_namespace, get_live_object, server_side_dry_run
 from helm_preview.core.runner import RunError
 from helm_preview.diff.engine import ChangeRecord, diff_all
 from helm_preview.output.json_out import render_json
@@ -21,6 +22,9 @@ from helm_preview.parser.manifest import (
     parse_multi_doc,
     pair_resources,
 )
+
+if TYPE_CHECKING:
+    from helm_preview.crd.report import CrdReport
 
 
 @click.group()
@@ -44,7 +48,7 @@ def main() -> None:
     default="terminal",
     help="Output format",
 )
-@click.option("--context", default=3, type=int, help="Lines of context around changes")
+@click.option("--context", default=None, type=int, hidden=True, help="Deprecated: has no effect")
 @click.option("--ignore-path", multiple=True, help="Additional dot-paths to ignore")
 @click.option("--kubeconfig", default=None, help="Path to kubeconfig")
 @click.option("--kube-context", default=None, help="Kubernetes context to use")
@@ -67,7 +71,7 @@ def diff(
     server_side: bool,
     show_all: bool,
     output_format: str,
-    context: int,
+    context: int | None,
     ignore_path: tuple[str, ...],
     kubeconfig: str | None,
     kube_context: str | None,
@@ -77,13 +81,16 @@ def diff(
     crd_policy: str,
 ) -> None:
     """Preview the diff of a Helm upgrade."""
-    ns = namespace or "default"
     kube_opts = {
         "kubeconfig": kubeconfig,
         "kube_context": kube_context,
     }
 
     try:
+        ns = namespace or current_namespace(**kube_opts)
+        if context is not None:
+            click.echo("Warning: --context is deprecated and has no effect", err=True)
+
         # 1. Fetch live manifests
         live_yaml = get_manifest(release, ns, **kube_opts)
         live_resources = parse_multi_doc(live_yaml, default_namespace=ns)
@@ -98,9 +105,12 @@ def diff(
         )
         upgrade_resources = parse_multi_doc(upgrade_yaml, default_namespace=ns)
 
-        # 3. Optional: server-side dry-run
+        # 3. Optional: server-side truth diff. Both sides must come from the
+        # API server, otherwise server-populated defaults show up as changes.
+        warnings: list[str] = []
         if server_side:
-            upgrade_resources = _apply_server_side(upgrade_resources, ns, **kube_opts)
+            live_resources = _fetch_live_objects(live_resources, warnings, **kube_opts)
+            upgrade_resources = _apply_server_side(upgrade_resources, warnings, **kube_opts)
 
         # 4. Parse & pair
         pairs = pair_resources(live_resources, upgrade_resources)
@@ -131,8 +141,18 @@ def diff(
             ownership = detect_ownership(resource) if resource else None
             full_results.append((change, risk_annotations, ownership))
 
-        # Count unchanged for JSON output
-        total_unchanged = sum(1 for p in non_crd_pairs if p.status == "unchanged")
+        # Unchanged = identical, or different only in filtered-out noise
+        total_unchanged = len(non_crd_pairs) - len(change_records)
+
+        if risk_only:
+            full_results = [
+                r for r in full_results
+                if any(a.level in (RiskLevel.WARNING, RiskLevel.DANGER) for a in r[1])
+            ]
+
+        # Warnings go to stderr so JSON on stdout stays machine-readable
+        for warning in warnings:
+            click.echo(f"Warning: {warning}", err=True)
 
         # 8. Output
         if output_format == "json":
@@ -142,8 +162,6 @@ def diff(
         else:
             render_terminal(
                 full_results,
-                context_lines=context,
-                show_all=show_all,
                 no_color=no_color,
                 risk_only=risk_only,
                 crd_report=crd_report,
@@ -185,24 +203,56 @@ def _run_crd_analysis(
     )
 
 
+def _fetch_live_objects(
+    resources: list[Resource], warnings: list[str], **kube_opts: str | None
+) -> list[Resource]:
+    """Replace stored release manifests with the live objects from the cluster.
+
+    Resources missing from the cluster are dropped (they will show as ADDED);
+    resources that cannot be fetched keep the stored manifest and are reported.
+    """
+    results: list[Resource] = []
+    for res in resources:
+        try:
+            live_yaml = get_live_object(
+                yaml.safe_dump(res.body), res.namespace, **kube_opts
+            )
+        except RunError as e:
+            warnings.append(
+                f"Could not fetch live {res.kind}/{res.name}; "
+                f"comparing against the stored release manifest ({e.stderr.strip()})"
+            )
+            results.append(res)
+            continue
+        if not live_yaml.strip():
+            warnings.append(
+                f"{res.kind}/{res.name} is in the release but missing from the cluster"
+            )
+            continue
+        live = parse_multi_doc(live_yaml, default_namespace=res.namespace)
+        results.append(live[0] if live else res)
+    return results
+
+
 def _apply_server_side(
-    resources: list[Resource], namespace: str, **kube_opts: str | None
+    resources: list[Resource], warnings: list[str], **kube_opts: str | None
 ) -> list[Resource]:
     """Apply server-side dry-run to each resource for truth-diff mode."""
     results: list[Resource] = []
     for res in resources:
         try:
             mutated_yaml = server_side_dry_run(
-                yaml.dump(res.body), namespace, **kube_opts
+                yaml.safe_dump(res.body), res.namespace, **kube_opts
             )
-            mutated = parse_multi_doc(mutated_yaml, default_namespace=namespace)
-            if mutated:
-                results.append(mutated[0])
-            else:
-                results.append(res)
-        except RunError:
-            # If server-side dry-run fails for a resource, use the original
+        except RunError as e:
+            warnings.append(
+                f"Server-side dry-run failed for {res.kind}/{res.name}; "
+                f"showing the client-rendered manifest ({e.stderr.strip()})"
+            )
             results.append(res)
+            continue
+        mutated = parse_multi_doc(mutated_yaml, default_namespace=res.namespace)
+        results.append(mutated[0] if mutated else res)
     return results
 
 
@@ -212,11 +262,10 @@ def _find_resource(
     new_resources: list[Resource],
 ) -> Resource | None:
     """Find the Resource object for a change record."""
-    # Prefer new resource, fall back to old
-    for res in new_resources:
-        if res.key == change.resource_key:
-            return res
-    for res in old_resources:
-        if res.key == change.resource_key:
+    # Prefer the current (old) resource: it reflects who manages it today.
+    # Keys can differ across an apiVersion migration, so match on identity.
+    identity = (change.kind, change.namespace, change.name)
+    for res in [*old_resources, *new_resources]:
+        if res.key == change.resource_key or (res.kind, res.namespace, res.name) == identity:
             return res
     return None

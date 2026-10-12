@@ -7,10 +7,11 @@ Semantic, noise-filtered, risk-aware diffs for Helm upgrades.
 ## Features
 
 - **Noise filtering** - Automatically strips `resourceVersion`, `uid`, `creationTimestamp`, `managedFields`, Helm bookkeeping annotations, and other fields that change on every apply but carry no semantic meaning.
-- **Semantic comparison** - Handles numeric strings vs integers (`"80"` vs `80`), boolean strings vs bools (`"true"` vs `true`), and normalizes unordered lists (env vars, ports, volumes) before diffing.
+- **Semantic comparison** - Handles a string vs a number (`"80"` vs `80`) or bool (`"true"` vs `true`), while two different strings (`"1.10"` vs `"1.1"`, `"yes"` vs `"true"`) are always reported as changes. Normalizes unordered lists (env vars, ports, volumes) before diffing.
 - **Risk analysis** - Flags dangerous changes with `[WARNING]` and `[DANGER]` badges: immutable field mutations, Service type escalation, PVC storage class changes, resource deletions, CRD schema changes, and RBAC rule modifications.
-- **Ownership detection** - Identifies whether resources are managed by Helm, ArgoCD, or Flux via standard labels and annotations.
-- **Server-side truth diff** - Optional `--server-side` mode sends rendered manifests through `kubectl apply --dry-run=server` to capture admission webhook mutations before diffing.
+- **Ownership detection** - Identifies whether resources are managed by Helm, ArgoCD, or Flux via standard labels and annotations. GitOps controllers take precedence, since ArgoCD and Flux also render charts with `managed-by: Helm`.
+- **Secret redaction** - Values under a `Secret`'s `data`/`stringData` are shown as `<redacted>` in terminal and JSON output; the keys and paths remain visible.
+- **Server-side truth diff** - Optional `--server-side` mode sends rendered manifests through `kubectl apply --dry-run=server` and fetches the live objects with `kubectl get`, so both sides carry the same server-populated defaults. Failures per resource are reported as warnings on stderr.
 - **Structured JSON output** - Machine-readable output with summaries, risk annotations, and per-field changes for integration into CI/CD gates.
 - **CRD analysis** - Optional `--check-crds` mode performs deep analysis of CustomResourceDefinition changes: graduated risk classification, stored-version safety checks, ownership conflict detection, live CR schema validation, and configurable policy enforcement (`--crd-policy ignore|warn|fail`).
 
@@ -278,19 +279,19 @@ The <CHART> argument points to the entire chart directory, not just values. The 
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--namespace` | `-n` | Kubernetes namespace (default: `default`) |
+| `--namespace` | `-n` | Kubernetes namespace (default: `$HELM_NAMESPACE`, else the current kubeconfig context's namespace, else `default`) |
 | `--values` | `-f` | Values file(s), can be repeated |
 | `--set` | | Set individual values (`key=val`), can be repeated |
 | `--version` | | Chart version to upgrade to |
 | `--server-side` | | Enable truth-diff mode (server-side dry-run) |
 | `--show-all` | | Disable noise filtering, show raw diff |
 | `--output` | `-o` | Output format: `terminal` (default) or `json` |
-| `--context` | | Lines of context around changes (default: `3`) |
+| `--context` | | Deprecated: has no effect (kept so existing scripts keep working) |
 | `--ignore-path` | | Additional dot-paths to ignore, can be repeated |
 | `--kubeconfig` | | Path to kubeconfig file |
 | `--kube-context` | | Kubernetes context to use |
 | `--no-color` | | Disable colored output |
-| `--risk-only` | | Only show changes with WARNING or DANGER risk level |
+| `--risk-only` | | Only show changes with WARNING or DANGER risk level (terminal and JSON output) |
 | `--check-crds` | | Enable CRD analysis (disabled by default) |
 | `--crd-policy` | | CRD policy mode: `ignore`, `warn` (default), or `fail` |
 
@@ -374,8 +375,8 @@ helm-preview diff my-release ./chart -n production --check-crds --crd-policy ign
 
 The CRD pipeline runs 10 analysis steps automatically:
 
-1. **Extract proposed CRDs** from the rendered upgrade manifests and the chart's `crds/` directory.
-2. **Discover installed CRDs** from the cluster via `kubectl get crds`. If the cluster is unreachable or permissions are insufficient, a warning is emitted and analysis continues against an empty set.
+1. **Extract proposed CRDs** from the rendered upgrade manifests. CRDs in the chart's `crds/` directory are not analysed because `helm upgrade` never applies them; they are listed in a warning instead.
+2. **Discover installed CRDs** from the cluster via `kubectl get crds`. If the cluster is unreachable or permissions are insufficient, a warning is emitted and the CRD comparison is skipped (it is never compared against an empty set), and `--crd-policy fail` blocks because the upgrade cannot be verified.
 3. **Pair** installed vs proposed CRDs by `metadata.name`.
 4. **Diff** each pair using the same noise-filtered, normalized engine as regular resources, with additional CRD-specific noise paths.
 5. **Classify** every field change into a graduated risk level (see table below).
@@ -416,7 +417,7 @@ The `--crd-policy` flag controls what happens when CRD issues are found:
 |------|----------|
 | `ignore` | All CRD issues are suppressed. The pipeline never blocks. |
 | `warn` (default) | Issues are displayed in the output but the exit code is always `0`. |
-| `fail` | If any CRD has a **DANGER**-level change, the command exits with code `1`. Useful as a CI/CD gate. |
+| `fail` | If any CRD has a **DANGER**-level change, an orphaned stored version, live CRs that fail the new schema, an ownership conflict, or the installed CRDs could not be retrieved, the command exits with code `1`. Useful as a CI/CD gate. |
 
 ### Terminal output
 
@@ -513,7 +514,9 @@ If permissions are missing, `helm-preview` emits a warning and continues with re
 6. NORMALIZE         Strip noise fields, sort dict keys,
                      sort unordered lists (env, ports, volumes)
        |
-7. DIFF              Structural diff via DeepDiff, semantic equality checks
+7. DIFF              Structural diff (lists of named items such as env vars,
+                     containers and CRD versions are matched by name, not position),
+                     semantic equality checks
        |
 8. ANALYZE           Run risk rules, detect ownership
        |
@@ -536,20 +539,28 @@ The following fields are stripped by default before comparison:
 
 Use `--show-all` to disable filtering, or `--ignore-path` to add custom paths to ignore.
 
+Paths are dot-separated, with a literal dot inside a key escaped as `\.`, which is exactly how paths are printed in the output, so you can copy one straight into `--ignore-path`. Any segment may use `*`, `?` or `[...]` wildcards (case-sensitive), and `*` or a number matches list items, e.g. `spec.template.spec.containers.*.image` or `metadata.annotations.example\.com/*`.
+
 ## Risk rules
 
 | Rule | Trigger | Level |
 |------|---------|-------|
-| `immutable_field` | Changes to Deployment `spec.selector.matchLabels`, Service `spec.clusterIP`, PVC `spec.storageClassName`, Job `spec.selector`, StatefulSet `spec.volumeClaimTemplates` | DANGER |
-| `service_type_change` | Service type changed from ClusterIP to NodePort/LoadBalancer | DANGER |
+| `immutable_field` | Changes to Deployment/DaemonSet `spec.selector`, Service `spec.clusterIP`, PVC `spec.storageClassName`/`accessModes`/`volumeName`, Job `spec.selector`/`spec.template`, StatefulSet `spec.selector`/`serviceName`/`podManagementPolicy`/`volumeClaimTemplates` | DANGER |
+| `service_type_change` | Service type changed from ClusterIP (or unset, which defaults to ClusterIP) to NodePort/LoadBalancer | DANGER |
 | `service_type_change` | Any other Service type change | WARNING |
 | `pvc_storage_class_change` | PVC `storageClassName` changed | DANGER |
 | `pvc_storage_change` | PVC storage request size changed | WARNING |
-| `resource_deleted` | Any resource removed from the release | WARNING |
+| `resource_deleted` | PersistentVolumeClaim, Namespace or CustomResourceDefinition removed from the release (data loss) | DANGER |
+| `resource_deleted` | Any other resource removed from the release | WARNING |
+| `resource_kept` | Resource removed from the chart but annotated `helm.sh/resource-policy: keep`, so it stays in the cluster | SAFE |
 | `crd_spec_change` | CRD scope, versions, validation, or names changed | DANGER |
 | `rbac_change` | ClusterRole or Role rules modified | WARNING |
+| `rbac_binding_change` | RoleBinding or ClusterRoleBinding subjects modified | WARNING |
+| `rbac_roleref_change` | RoleBinding or ClusterRoleBinding `roleRef` modified (immutable, the upgrade will fail) | DANGER |
 
 ## JSON output schema
+
+`summary.unchanged` counts resources that are identical or differ only in filtered-out noise. `risk_summary` counts changes (not individual annotations) by their highest risk level; a change with no annotations counts as `safe`.
 
 ```json
 {

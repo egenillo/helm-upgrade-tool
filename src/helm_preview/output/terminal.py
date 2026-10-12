@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -10,6 +12,9 @@ from rich.text import Text
 from helm_preview.analysis.ownership import OwnershipInfo
 from helm_preview.analysis.risk import RiskAnnotation, RiskLevel
 from helm_preview.diff.engine import ChangeRecord, FieldChange
+
+if TYPE_CHECKING:
+    from helm_preview.crd.report import CrdReport
 
 # Style mappings
 RISK_STYLES = {
@@ -34,8 +39,6 @@ STATUS_STYLES = {
 
 def render_terminal(
     results: list[tuple[ChangeRecord, list[RiskAnnotation], OwnershipInfo | None]],
-    context_lines: int = 3,
-    show_all: bool = False,
     no_color: bool = False,
     risk_only: bool = False,
     crd_report: "CrdReport | None" = None,
@@ -126,14 +129,12 @@ def _render_field_change(
 ) -> None:
     """Render a single field change."""
     # Check if this field has risk annotations
-    field_risks = [a for a in risk_annotations if a.path == fc.path]
+    max_level = _max_risk([a for a in risk_annotations if a.path == fc.path])
     risk_marker = ""
-    if field_risks:
-        max_level = max(a.level.value for a in field_risks)
-        if max_level == RiskLevel.DANGER.value:
-            risk_marker = " !!"
-        elif max_level == RiskLevel.WARNING.value:
-            risk_marker = " !"
+    if max_level == RiskLevel.DANGER:
+        risk_marker = " !!"
+    elif max_level == RiskLevel.WARNING:
+        risk_marker = " !"
 
     if fc.change_type == "value_changed":
         content.append(f"  ~ {fc.path}{risk_marker}\n", style="yellow")
@@ -169,8 +170,6 @@ def _max_risk(annotations: list[RiskAnnotation]) -> RiskLevel | None:
 
 def _render_crd_section(console: Console, crd_report: "CrdReport") -> None:
     """Render the CRD Analysis section."""
-    from helm_preview.crd.report import CrdReport
-
     console.print()
     console.rule("[bold cyan]CRD Analysis[/bold cyan]")
     console.print()

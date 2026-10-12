@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from helm_preview.analysis.ownership import OwnershipInfo
 from helm_preview.analysis.risk import RiskAnnotation, RiskLevel
 from helm_preview.diff.engine import ChangeRecord
+
+if TYPE_CHECKING:
+    from helm_preview.crd.report import CrdReport
 
 
 def render_json(
@@ -20,14 +23,12 @@ def render_json(
     removed = sum(1 for cr, _, _ in results if cr.status == "removed")
     changed = sum(1 for cr, _, _ in results if cr.status == "changed")
 
+    # One entry per change, at its highest risk level (no annotations = safe)
+    severity = [RiskLevel.SAFE, RiskLevel.WARNING, RiskLevel.DANGER]
     risk_counts = {level.value: 0 for level in RiskLevel}
     for _, annotations, _ in results:
-        for a in annotations:
-            risk_counts[a.level.value] += 1
-    # Changes with no risk annotations count as safe
-    for cr, annotations, _ in results:
-        if not annotations:
-            risk_counts["safe"] += 1
+        worst = max((a.level for a in annotations), key=severity.index, default=RiskLevel.SAFE)
+        risk_counts[worst.value] += 1
 
     output: dict[str, Any] = {
         "summary": {

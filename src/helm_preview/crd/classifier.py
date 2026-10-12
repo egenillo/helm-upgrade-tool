@@ -53,8 +53,9 @@ def _classify_single(fc: FieldChange) -> RiskAnnotation:
 
     # Removed version (whole entry removed from spec.versions)
     if re.match(r"^spec\.versions\[\d+\]$", path) and change_type == "item_removed":
-        return _annotation(RiskLevel.DANGER, "crd_version_removed",
-                           "CRD version removed", path)
+        removed = fc.old_value.get("name") if isinstance(fc.old_value, dict) else None
+        label = f"CRD version '{removed}' removed" if removed else "CRD version removed"
+        return _annotation(RiskLevel.DANGER, "crd_version_removed", label, path)
 
     # New required field added
     if (re.search(r"spec\.versions\[\d+\]\.schema\..*\.required", path)

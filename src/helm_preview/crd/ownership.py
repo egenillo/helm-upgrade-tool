@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from helm_preview.analysis.ownership import OwnershipInfo, detect_ownership
+from helm_preview.analysis.ownership import detect_ownership
 from helm_preview.parser.manifest import Resource
 
 

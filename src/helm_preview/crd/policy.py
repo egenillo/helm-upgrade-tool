@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 
 from helm_preview.analysis.risk import RiskLevel
-from helm_preview.crd.report import CrdChangeDetail, CrdReport, PolicyResult
+from helm_preview.crd.report import CrdReport, PolicyResult
 
 
 class CrdPolicyMode(Enum):
@@ -31,6 +31,7 @@ def evaluate_policy(report: CrdReport, mode: CrdPolicyMode) -> PolicyResult:
 
     danger_crds = [c for c in report.crds if c.max_risk == RiskLevel.DANGER]
     warning_crds = [c for c in report.crds if c.max_risk == RiskLevel.WARNING]
+    other_issues = _other_blocking_issues(report)
 
     if mode == CrdPolicyMode.WARN:
         parts: list[str] = []
@@ -40,6 +41,7 @@ def evaluate_policy(report: CrdReport, mode: CrdPolicyMode) -> PolicyResult:
         if warning_crds:
             names = ", ".join(c.name for c in warning_crds)
             parts.append(f"{len(warning_crds)} CRD(s) with WARNING-level changes: {names}")
+        parts.extend(other_issues)
         if not parts:
             msg = "CRD policy: warn (no issues found)"
         else:
@@ -52,12 +54,16 @@ def evaluate_policy(report: CrdReport, mode: CrdPolicyMode) -> PolicyResult:
         )
 
     # mode == FAIL
+    blockers: list[str] = []
     if danger_crds:
         names = ", ".join(c.name for c in danger_crds)
+        blockers.append(f"{len(danger_crds)} CRD(s) with DANGER-level changes: {names}")
+    blockers.extend(other_issues)
+    if blockers:
         return PolicyResult(
             mode=mode.value,
             blocked=True,
-            message=f"CRD policy: fail - {len(danger_crds)} CRD(s) with DANGER-level changes: {names}",
+            message="CRD policy: fail - " + "; ".join(blockers),
             exit_code=1,
         )
 
@@ -76,3 +82,19 @@ def evaluate_policy(report: CrdReport, mode: CrdPolicyMode) -> PolicyResult:
         message="CRD policy: fail (passed) - no issues found",
         exit_code=0,
     )
+
+
+def _other_blocking_issues(report: CrdReport) -> list[str]:
+    """Problems that are unsafe regardless of the risk level of the diff."""
+    issues: list[str] = []
+    if report.discovery_failed:
+        issues.append("installed CRDs could not be retrieved, so the upgrade cannot be verified")
+    for label, selector in (
+        ("orphaned stored versions", lambda c: c.stored_version_warnings),
+        ("live CRs failing the new schema", lambda c: c.schema_validation_errors),
+        ("ownership conflicts", lambda c: c.ownership_conflict),
+    ):
+        names = [c.name for c in report.crds if selector(c)]
+        if names:
+            issues.append(f"{len(names)} CRD(s) with {label}: {', '.join(names)}")
+    return issues
