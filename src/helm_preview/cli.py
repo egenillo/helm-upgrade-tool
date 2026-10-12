@@ -12,7 +12,8 @@ from helm_preview.analysis.ownership import OwnershipInfo, detect_ownership
 from helm_preview.analysis.risk import RiskAnnotation, RiskLevel, assess_risk
 from helm_preview.core.helm import dry_run_upgrade, get_manifest
 from helm_preview.core.kubectl import current_namespace, get_live_object, server_side_dry_run
-from helm_preview.core.runner import RunError
+from helm_preview.config import DEFAULT_TIMEOUT
+from helm_preview.core.runner import RunError, set_default_timeout
 from helm_preview.diff.engine import ChangeRecord, diff_all
 from helm_preview.output.json_out import render_json
 from helm_preview.output.terminal import render_terminal
@@ -40,6 +41,14 @@ def main() -> None:
 @click.option("-f", "--values", multiple=True, help="Values file(s)")
 @click.option("--set", "set_values", multiple=True, help="Set values (key=val)")
 @click.option("--version", default=None, help="Chart version")
+@click.option(
+    "--reuse-values", is_flag=True,
+    help="Reuse the last release's values and merge in overrides (helm --reuse-values)",
+)
+@click.option(
+    "--reset-then-reuse-values", is_flag=True,
+    help="Reset to the chart's values, then reuse the last release's (helm --reset-then-reuse-values, Helm 3.14+)",
+)
 @click.option("--server-side", is_flag=True, help="Truth-diff via server-side dry-run")
 @click.option("--show-all", is_flag=True, help="Disable noise filtering")
 @click.option(
@@ -52,8 +61,29 @@ def main() -> None:
 @click.option("--ignore-path", multiple=True, help="Additional dot-paths to ignore")
 @click.option("--kubeconfig", default=None, help="Path to kubeconfig")
 @click.option("--kube-context", default=None, help="Kubernetes context to use")
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=0),
+    default=DEFAULT_TIMEOUT,
+    show_default=True,
+    envvar="HELM_PREVIEW_TIMEOUT",
+    show_envvar=True,
+    help="Seconds to wait for each helm/kubectl command (0 = no limit)",
+)
+@click.option(
+    "--secrets",
+    type=click.Choice(["redact", "hash", "show"]),
+    default="redact",
+    help="How to display Secret values: redact (default), hash (keyed fingerprint), show (plain text)",
+)
 @click.option("--no-color", is_flag=True, help="Disable colored output")
 @click.option("--risk-only", is_flag=True, help="Only show WARNING/DANGER changes")
+@click.option(
+    "--fail-on",
+    type=click.Choice(["none", "warning", "danger"]),
+    default="none",
+    help="Exit with code 1 if any finding is at or above this level (default: none)",
+)
 @click.option("--check-crds", is_flag=True, help="Enable CRD analysis")
 @click.option(
     "--crd-policy",
@@ -68,6 +98,8 @@ def diff(
     values: tuple[str, ...],
     set_values: tuple[str, ...],
     version: str | None,
+    reuse_values: bool,
+    reset_then_reuse_values: bool,
     server_side: bool,
     show_all: bool,
     output_format: str,
@@ -75,21 +107,36 @@ def diff(
     ignore_path: tuple[str, ...],
     kubeconfig: str | None,
     kube_context: str | None,
+    timeout: int,
+    secrets: str,
     no_color: bool,
     risk_only: bool,
+    fail_on: str,
     check_crds: bool,
     crd_policy: str,
 ) -> None:
     """Preview the diff of a Helm upgrade."""
+    if reuse_values and reset_then_reuse_values:
+        raise click.UsageError(
+            "--reuse-values and --reset-then-reuse-values are mutually exclusive"
+        )
     kube_opts = {
         "kubeconfig": kubeconfig,
         "kube_context": kube_context,
     }
 
+    set_default_timeout(timeout or None)
+
     try:
         ns = namespace or current_namespace(**kube_opts)
         if context is not None:
             click.echo("Warning: --context is deprecated and has no effect", err=True)
+        if secrets == "show":
+            click.echo(
+                "Warning: --secrets show prints Secret values in clear text; "
+                "do not use it in CI logs",
+                err=True,
+            )
 
         # 1. Fetch live manifests
         live_yaml = get_manifest(release, ns, **kube_opts)
@@ -101,6 +148,8 @@ def diff(
             values_files=list(values),
             set_values=list(set_values),
             version=version,
+            reuse_values=reuse_values,
+            reset_then_reuse_values=reset_then_reuse_values,
             **kube_opts,
         )
         upgrade_resources = parse_multi_doc(upgrade_yaml, default_namespace=ns)
@@ -130,6 +179,7 @@ def diff(
             non_crd_pairs,
             show_all=show_all,
             extra_ignores=list(ignore_path) if ignore_path else None,
+            secrets=secrets,
         )
 
         # 7. Risk analysis + ownership
@@ -143,6 +193,8 @@ def diff(
 
         # Unchanged = identical, or different only in filtered-out noise
         total_unchanged = len(non_crd_pairs) - len(change_records)
+
+        all_results = full_results  # --fail-on looks at everything, even if hidden
 
         if risk_only:
             full_results = [
@@ -167,13 +219,44 @@ def diff(
                 crd_report=crd_report,
             )
 
-        # Exit non-zero if CRD policy blocks
-        if crd_report and crd_report.policy_result and crd_report.policy_result.blocked:
+        # Exit non-zero if the CRD policy blocks or --fail-on is triggered
+        failed = bool(
+            crd_report and crd_report.policy_result and crd_report.policy_result.blocked
+        )
+        if fail_on != "none":
+            findings = _count_findings(
+                all_results,
+                crd_report if crd_policy != "ignore" else None,
+                RiskLevel(fail_on),
+            )
+            if findings:
+                click.echo(
+                    f"--fail-on {fail_on}: {findings} finding(s) at {fail_on.upper()} "
+                    f"level or above",
+                    err=True,
+                )
+                failed = True
+        if failed:
             sys.exit(1)
 
     except RunError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+_SEVERITY = {RiskLevel.SAFE: 0, RiskLevel.WARNING: 1, RiskLevel.DANGER: 2}
+
+
+def _count_findings(
+    results: list[tuple[ChangeRecord, list[RiskAnnotation], OwnershipInfo | None]],
+    crd_report: "CrdReport | None",
+    threshold: RiskLevel,
+) -> int:
+    """Count risk annotations at or above `threshold`, including CRD findings."""
+    annotations = [a for _, ras, _ in results for a in ras]
+    if crd_report:
+        annotations += [a for crd in crd_report.crds for a in crd.risk_annotations]
+    return sum(1 for a in annotations if _SEVERITY[a.level] >= _SEVERITY[threshold])
 
 
 def _is_crd_pair(pair: ResourcePair) -> bool:

@@ -31,9 +31,14 @@ def dry_run_upgrade(
     values_files: list[str] | None = None,
     set_values: list[str] | None = None,
     version: str | None = None,
+    reuse_values: bool = False,
+    reset_then_reuse_values: bool = False,
     **kube_opts: str | None,
 ) -> str:
     """helm upgrade <release> <chart> --dry-run -n <ns> ... -> raw YAML string.
+
+    reuse_values / reset_then_reuse_values are passed straight to helm; they
+    control which of the release's previous values the rendered upgrade keeps.
 
     Strips NOTES: and HOOKS: sections from output.
     """
@@ -44,6 +49,10 @@ def dry_run_upgrade(
         cmd += ["--set", sv]
     if version:
         cmd += ["--version", version]
+    if reuse_values:
+        cmd.append("--reuse-values")
+    if reset_then_reuse_values:
+        cmd.append("--reset-then-reuse-values")
     cmd += _kube_flags(**kube_opts)
 
     output = run(cmd)

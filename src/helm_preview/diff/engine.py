@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -39,8 +42,12 @@ def compute_diff(
     pair: ResourcePair,
     show_all: bool = False,
     extra_ignores: list[str] | None = None,
+    secrets: str = "redact",
 ) -> ChangeRecord | None:
     """Compute diff for a single resource pair.
+
+    `secrets` controls how Secret payload values are shown: "redact"
+    (placeholder), "hash" (keyed fingerprint) or "show" (plain text).
 
     Returns None for unchanged resources.
     """
@@ -91,8 +98,8 @@ def compute_diff(
     if not changes:
         return None
 
-    if pair.new.kind == "Secret":
-        changes = [_redact_secret_change(fc) for fc in changes]
+    if pair.new.kind == "Secret" and secrets != "show":
+        changes = [_mask_secret_change(fc, secrets) for fc in changes]
 
     return ChangeRecord(
         resource_key=pair.new.key,
@@ -115,8 +122,8 @@ _SECRET_SENSITIVE_PREFIXES = (
 )
 
 
-def _redact_secret_change(fc: FieldChange) -> FieldChange:
-    """Replace Secret payload values with a placeholder, keeping the path."""
+def _mask_secret_change(fc: FieldChange, mode: str) -> FieldChange:
+    """Mask Secret payload values (placeholder or fingerprint), keeping the path."""
     if not any(
         fc.path == p or fc.path.startswith(p + ".") or fc.path.startswith(p + "[")
         for p in _SECRET_SENSITIVE_PREFIXES
@@ -124,19 +131,30 @@ def _redact_secret_change(fc: FieldChange) -> FieldChange:
         return fc
     return FieldChange(
         path=fc.path,
-        old_value=_redact_value(fc.old_value),
-        new_value=_redact_value(fc.new_value),
+        old_value=_mask_value(fc.old_value, mode),
+        new_value=_mask_value(fc.new_value, mode),
         change_type=fc.change_type,
     )
 
 
-def _redact_value(value: Any) -> Any:
-    """Redact leaf values, keeping dict keys so users can see what changed."""
+# Random per process: fingerprints are comparable within one run (old vs new) but
+# cannot be precomputed or brute-forced offline, and mean nothing across runs.
+_FINGERPRINT_KEY = os.urandom(16)
+
+
+def fingerprint(value: Any) -> str:
+    """Short keyed hash of a value, e.g. '<hash:1a2b3c4d>'."""
+    digest = hmac.new(_FINGERPRINT_KEY, str(value).encode(), hashlib.sha256).hexdigest()
+    return f"<hash:{digest[:8]}>"
+
+
+def _mask_value(value: Any, mode: str) -> Any:
+    """Mask leaf values, keeping dict keys so users can see what changed."""
     if value is None:
         return None
     if isinstance(value, dict):
-        return {k: _redact_value(v) for k, v in value.items()}
-    return REDACTED
+        return {k: _mask_value(v, mode) for k, v in value.items()}
+    return fingerprint(value) if mode == "hash" else REDACTED
 
 
 def diff_values(old: Any, new: Any, path: str = "") -> list[FieldChange]:
@@ -221,11 +239,14 @@ def diff_all(
     pairs: list[ResourcePair],
     show_all: bool = False,
     extra_ignores: list[str] | None = None,
+    secrets: str = "redact",
 ) -> list[ChangeRecord]:
     """Compute diff for all pairs, filter out unchanged."""
     results: list[ChangeRecord] = []
     for pair in pairs:
-        record = compute_diff(pair, show_all=show_all, extra_ignores=extra_ignores)
+        record = compute_diff(
+            pair, show_all=show_all, extra_ignores=extra_ignores, secrets=secrets
+        )
         if record is not None:
             results.append(record)
     return results

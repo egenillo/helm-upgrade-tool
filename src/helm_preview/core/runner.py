@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from typing import Any
 
 from helm_preview.config import DEFAULT_TIMEOUT
 
@@ -19,8 +20,24 @@ class RunError(Exception):
         )
 
 
-def run(cmd: list[str], timeout: int = DEFAULT_TIMEOUT, stdin: str | None = None) -> str:
+# Per-command limit used when run() is not given an explicit timeout.
+# None means no limit. Set once per CLI invocation via set_default_timeout().
+_timeout: float | None = DEFAULT_TIMEOUT
+_USE_DEFAULT: Any = object()
+
+
+def set_default_timeout(seconds: float | None) -> None:
+    """Set the timeout (seconds) for every later run(); None disables it."""
+    global _timeout
+    _timeout = seconds
+
+
+def run(
+    cmd: list[str], timeout: float | None = _USE_DEFAULT, stdin: str | None = None
+) -> str:
     """Run subprocess, capture stdout, raise on non-zero exit."""
+    if timeout is _USE_DEFAULT:
+        timeout = _timeout
     try:
         result = subprocess.run(
             cmd,
@@ -36,7 +53,9 @@ def run(cmd: list[str], timeout: int = DEFAULT_TIMEOUT, stdin: str | None = None
             cmd, 127, f"'{cmd[0]}' was not found on PATH. Install it or add it to PATH."
         ) from None
     except subprocess.TimeoutExpired:
-        raise RunError(cmd, -1, f"timed out after {timeout}s") from None
+        raise RunError(
+            cmd, -1, f"timed out after {timeout:g}s (raise the limit with --timeout)"
+        ) from None
     except OSError as e:
         raise RunError(cmd, 126, f"could not execute '{cmd[0]}': {e}") from None
     if result.returncode != 0:

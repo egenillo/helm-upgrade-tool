@@ -10,7 +10,7 @@ Semantic, noise-filtered, risk-aware diffs for Helm upgrades.
 - **Semantic comparison** - Handles a string vs a number (`"80"` vs `80`) or bool (`"true"` vs `true`), while two different strings (`"1.10"` vs `"1.1"`, `"yes"` vs `"true"`) are always reported as changes. Normalizes unordered lists (env vars, ports, volumes) before diffing.
 - **Risk analysis** - Flags dangerous changes with `[WARNING]` and `[DANGER]` badges: immutable field mutations, Service type escalation, PVC storage class changes, resource deletions, CRD schema changes, and RBAC rule modifications.
 - **Ownership detection** - Identifies whether resources are managed by Helm, ArgoCD, or Flux via standard labels and annotations. GitOps controllers take precedence, since ArgoCD and Flux also render charts with `managed-by: Helm`.
-- **Secret redaction** - Values under a `Secret`'s `data`/`stringData` are shown as `<redacted>` in terminal and JSON output; the keys and paths remain visible.
+- **Secret masking** - Values under a `Secret`'s `data`/`stringData` are shown as `<redacted>` in terminal and JSON output; the keys and paths remain visible. `--secrets hash` shows a short keyed fingerprint instead, and `--secrets show` prints the values (see [Secrets](#secrets)).
 - **Server-side truth diff** - Optional `--server-side` mode sends rendered manifests through `kubectl apply --dry-run=server` and fetches the live objects with `kubectl get`, so both sides carry the same server-populated defaults. Failures per resource are reported as warnings on stderr.
 - **Structured JSON output** - Machine-readable output with summaries, risk annotations, and per-field changes for integration into CI/CD gates.
 - **CRD analysis** - Optional `--check-crds` mode performs deep analysis of CustomResourceDefinition changes: graduated risk classification, stored-version safety checks, ownership conflict detection, live CR schema validation, and configurable policy enforcement (`--crd-policy ignore|warn|fail`).
@@ -283,6 +283,8 @@ The <CHART> argument points to the entire chart directory, not just values. The 
 | `--values` | `-f` | Values file(s), can be repeated |
 | `--set` | | Set individual values (`key=val`), can be repeated |
 | `--version` | | Chart version to upgrade to |
+| `--reuse-values` | | Pass `--reuse-values` to helm: start from the values of the last release and merge your `-f`/`--set` overrides on top |
+| `--reset-then-reuse-values` | | Pass `--reset-then-reuse-values` to helm (requires Helm 3.14+): start from the new chart's defaults, then re-apply the last release's values and your overrides. Mutually exclusive with `--reuse-values` |
 | `--server-side` | | Enable truth-diff mode (server-side dry-run) |
 | `--show-all` | | Disable noise filtering, show raw diff |
 | `--output` | `-o` | Output format: `terminal` (default) or `json` |
@@ -292,8 +294,45 @@ The <CHART> argument points to the entire chart directory, not just values. The 
 | `--kube-context` | | Kubernetes context to use |
 | `--no-color` | | Disable colored output |
 | `--risk-only` | | Only show changes with WARNING or DANGER risk level (terminal and JSON output) |
+| `--fail-on` | | Exit with code `1` if any finding is at or above `warning` or `danger` (default: `none`) |
+| `--secrets` | | How to display Secret values: `redact` (default), `hash` or `show` |
+| `--timeout` | | Seconds to wait for **each** `helm`/`kubectl` command (default: `60`, `0` = no limit). Can also be set with the `HELM_PREVIEW_TIMEOUT` environment variable; the flag wins. Raise it for large charts, slow clusters or many CRs |
 | `--check-crds` | | Enable CRD analysis (disabled by default) |
 | `--crd-policy` | | CRD policy mode: `ignore`, `warn` (default), or `fail` |
+
+### Matching your real upgrade command
+
+By default `helm upgrade` resets values to the chart's defaults, so values you set in earlier upgrades (`--set`, `-f`) are dropped and the preview shows them as changes. If you normally upgrade with `--reuse-values`, pass the same flag so the preview matches what will actually happen:
+
+```bash
+helm-preview diff my-app ./chart -n production --reuse-values --set image.tag=2.0.0
+```
+
+### Secrets
+
+Changes to a `Secret`'s `data`, `stringData` (and its `last-applied-configuration` annotation) never print their values by default. `--secrets` selects what you see instead:
+
+| Mode | Shows | Use it for |
+|------|-------|------------|
+| `redact` (default) | `<redacted>` | CI logs and anything shared |
+| `hash` | `<hash:1a2b3c4d>`, a keyed fingerprint | Seeing that a value changed, and comparing old vs new within one run, without exposing it. The key is random per run, so fingerprints cannot be precomputed or compared between runs |
+| `show` | the real values (base64 for `data`) | Local debugging only. A warning is printed on stderr |
+
+Keys and paths are visible in every mode, and only Secrets are masked; other resources (e.g. ConfigMaps) are always shown as-is. Note that `--set` values and values files are your own input and are not masked.
+
+### CI gating
+
+`--fail-on` turns the risk analysis into a pipeline gate. The diff is still printed in full; afterwards the command exits with code `1` if any risk finding reaches the chosen level, with a summary line on stderr (so `-o json` output on stdout stays valid JSON).
+
+```bash
+# Block the pipeline on any DANGER finding (immutable fields, Service escalation, PVC/CRD deletion, ...)
+helm-preview diff my-app ./chart -n production -o json --fail-on danger
+
+# Stricter: also block on WARNING findings
+helm-preview diff my-app ./chart -n production --fail-on warning
+```
+
+Findings are counted across all changes, regardless of `--risk-only`. With `--check-crds`, CRD findings are included too (unless `--crd-policy ignore`), and `--crd-policy fail` can still block on its own. Errors such as an unreachable cluster also exit with `1`; the message on stderr tells them apart.
 
 ### Examples
 
